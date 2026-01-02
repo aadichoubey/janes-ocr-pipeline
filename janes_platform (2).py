@@ -19,115 +19,142 @@ data = []
 current_country = None
 current_class_of_ship = None
 current_entry = None
+last_was_font5 = False
 
 # -------------------------
 # HELPERS
 # -------------------------
 def clean_ship_name(name):
-    name = re.sub(r"\(.*?\)", "", name)        # remove (ex-...)
-    name = re.sub(r"\b[PYA]\s?\d+\b", "", name) # remove pennant numbers
+    name = re.sub(r"\(.*?\)", "", name)
+    name = re.sub(r"\b[PYA]\s?\d+\b", "", name)
     return name.strip()
 
 def normalize_band(text):
-    text = text.lower()
-    if "l-band" in text or "i-band" in text:
+    t = text.lower()
+    if "l-band" in t or "i-band" in t:
         return "I-band"
-    if "e/f" in text:
+    if "e/f" in t:
         return "E/F-band"
-    if "g-band" in text:
+    if "g-band" in t:
         return "G-band"
     return ""
 
+def extract_inline_names(text):
+    names = re.findall(
+        r"[A-Z][A-Z0-9'’\-]+(?:\s[A-Z0-9'’\-]+)*",
+        text
+    )
+    return [clean_ship_name(n) for n in names if len(n) > 2]
+
 # -------------------------
-# MAIN LOOP (ORDER MATTERS)
+# MAIN STREAM LOOP
 # -------------------------
-for elem in soup.find_all(["h1", "h2", "h3", "p", "table", "img"]):
+for elem in soup.find_all(["span", "p", "table", "img"]):
 
-    # ---- COUNTRY ----
-    if elem.name == "h1":
-        span = elem.find("span", class_="font8")
-        if span:
-            # close previous entry
-            if current_entry:
-                data.append(current_entry)
-                current_entry = None
-
-            current_country = span.get_text(strip=True)
-            current_class_of_ship = None
-
-    # ---- CLASS OF SHIP (PATROL FORCES etc.) ----
-    elif elem.name in ["h2", "p"]:
-        text = elem.get_text(strip=True)
-        if text.isupper() and 5 < len(text) < 40:
-            current_class_of_ship = text
-
-    # ---- PLATFORM CLASS ----
-    elif elem.name == "h3":
-        # close previous platform class
+    # -------------------------
+    # COUNTRY (font8)
+    # -------------------------
+    if elem.name == "span" and "font8" in (elem.get("class") or []):
         if current_entry:
             data.append(current_entry)
+            current_entry = None
 
-        current_entry = {
-            "COUNTRY_NAME": current_country,
-            "CLASS_OF_SHIP": current_class_of_ship,
-            "PLATFORM_CLASS": elem.get_text(" ", strip=True),
-            "PLATFORM NAMES": [],
-            "RADARS": [],
-            "IMG_PATH": []
-        }
+        current_country = elem.get_text(strip=True)
+        current_class_of_ship = None
+        last_was_font5 = False
 
-    # ---- TABLE: PLATFORM NAMES ----
+    # -------------------------
+    # PLATFORM TYPE (font6)
+    # -------------------------
+    elif elem.name == "span" and "font6" in (elem.get("class") or []):
+        current_class_of_ship = elem.get_text(strip=True)
+        last_was_font5 = False
+
+    # -------------------------
+    # PLATFORM CLASS (font5)
+    # -------------------------
+    elif elem.name == "span" and "font5" in (elem.get("class") or []):
+        text = elem.get_text(strip=True)
+
+        # merge consecutive font5 spans (e.g. "(PB)")
+        if current_entry and last_was_font5:
+            current_entry["PLATFORM_CLASS"] += f" {text}"
+        else:
+            if current_entry:
+                data.append(current_entry)
+
+            current_entry = {
+                "COUNTRY_NAME": current_country,
+                "CLASS_OF_SHIP": current_class_of_ship,
+                "PLATFORM_CLASS": text,
+                "PLATFORM NAMES": [],
+                "RADARS": [],
+                "IMG_PATH": []
+            }
+
+        last_was_font5 = True
+        continue
+
+    # -------------------------
+    # TABLE PLATFORM NAMES
+    # -------------------------
     elif elem.name == "table" and current_entry:
-        rows = elem.find_all("tr")
-        for row in rows[1:]:
+        for row in elem.find_all("tr")[1:]:
             cols = row.find_all("td")
             if cols:
                 name = clean_ship_name(cols[0].get_text(strip=True))
-                if name:
+                if name and name not in current_entry["PLATFORM NAMES"]:
                     current_entry["PLATFORM NAMES"].append(name)
 
-    # ---- INLINE PLATFORM NAMES ----
+        last_was_font5 = False
+
+    # -------------------------
+    # PARAGRAPHS (RADARS + INLINE NAMES)
+    # -------------------------
     elif elem.name == "p" and current_entry:
         text = elem.get_text(" ", strip=True)
+        bold = elem.find("b")
 
-        # RADARS
-        if text.lower().startswith("radars"):
-            radar_parts = text.split(".")
-            for part in radar_parts:
+        # ---- RADARS (this is why they were empty before)
+        if bold and "radars" in bold.get_text(strip=True).lower():
+            radar_text = re.sub(r"^Radars:\s*", "", text, flags=re.I)
+            parts = radar_text.split(".")
+            for part in parts:
                 if ":" in part:
                     rtype, rest = part.split(":", 1)
                     rname = rest.split(";")[0].strip()
                     band = normalize_band(rest)
 
                     current_entry["RADARS"].append({
-                        "RADAR_TYPE": rtype.replace("Radars", "").strip(),
+                        "RADAR_TYPE": rtype.strip(),
                         "RADAR_NAME": rname,
                         "BAND_TYPE": band
                     })
 
-        # PLATFORM NAMES INLINE
-        elif re.search(r"\b[A-Z]{3,}\b", text) and len(text) < 200:
-            names = re.findall(r"[A-Z][A-Z0-9'’\-]+(?:\s[A-Z0-9'’\-]+)*", text)
-            for n in names:
-                clean = clean_ship_name(n)
-                if clean and clean not in current_entry["PLATFORM NAMES"]:
-                    current_entry["PLATFORM NAMES"].append(clean)
+        # ---- INLINE PLATFORM NAMES
+        elif text.isupper() and len(text) < 200:
+            for n in extract_inline_names(text):
+                if n not in current_entry["PLATFORM NAMES"]:
+                    current_entry["PLATFORM NAMES"].append(n)
 
-    # ---- IMAGES ----
+        last_was_font5 = False
+
+    # -------------------------
+    # IMAGES
+    # -------------------------
     elif elem.name == "img" and current_entry:
         src = elem.get("src")
         if src:
             current_entry["IMG_PATH"].append(src)
 
+        last_was_font5 = False
+
 # -------------------------
-# FINALIZE LAST ENTRY
+# FINALIZE
 # -------------------------
 if current_entry:
     data.append(current_entry)
 
-# -------------------------
-# WRITE OUTPUT
-# -------------------------
 with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
     json.dump(data, f, indent=2, ensure_ascii=False)
 
